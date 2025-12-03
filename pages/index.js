@@ -81,7 +81,6 @@ function NotificationButton({ show, onClick }) {
     </button>
   );
 }
-// this for new commint in git
 function TabsBar({ activeView, setActiveView }) {
   return (
     <div className="toolbar">
