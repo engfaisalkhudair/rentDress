@@ -1,104 +1,144 @@
 // pages/api/checkReturnReminders.js
-import admin from '../../lib/firebaseAdmin';
+import { adminDb, adminMessaging } from '../../lib/firebaseAdmin';
 
-const firestore = admin.firestore();
-
-function formatDateYmd(date) {
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
+function formatYmd(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
 }
 
 export default async function handler(req, res) {
-  if (req.method !== 'GET' && req.method !== 'POST') {
+  if (req.method !== 'GET') {
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
   }
 
   try {
-    if (!admin.apps.length) {
-      return res
-        .status(500)
-        .json({ ok: false, error: 'Firebase admin not initialized' });
+    if (!adminDb || !adminMessaging) {
+      return res.status(500).json({
+        ok: false,
+        error: 'firebase-admin-not-configured',
+      });
     }
 
-    // نحسب التاريخ بعد يومين من اليوم الحالي
-    const now = new Date();
-    const targetDate = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate() + 2,
-      0,
-      0,
-      0
+    // اليوم + 2
+    const today = new Date();
+    const target = new Date(
+      today.getFullYear(),
+      today.getMonth(),
+      today.getDate() + 2
     );
-    const targetYmd = formatDateYmd(targetDate);
+    const targetYmd = formatYmd(target);
 
-    // نجيب الحجوزات اللي يبدأ حجزها بعد يومين (بناءً على startDateYmd)
-    const bookingsSnap = await firestore
-      .collection('bookings')
-      .where('startDateYmd', '==', targetYmd)
-      .get();
+    // نجيب كل الحجوزات
+    const bookingsSnap = await adminDb.collection('bookings').get();
 
     if (bookingsSnap.empty) {
       return res.status(200).json({
         ok: true,
-        message: 'No bookings starting in 2 days',
+        message: 'No bookings in collection',
         targetYmd,
+        totalSent: 0,
+        totalFailed: 0,
       });
     }
 
-    // نجيب كل التوكينات المسجلة للأجهزة اللي فعّلت الإشعارات
-    const tokensSnap = await firestore.collection('deviceTokens').get();
+    // نجيب كل التوكينات
+    const tokensSnap = await adminDb.collection('deviceTokens').get();
+    if (tokensSnap.empty) {
+      return res.status(200).json({
+        ok: true,
+        message: 'No device tokens saved',
+        targetYmd,
+        totalSent: 0,
+        totalFailed: 0,
+      });
+    }
+
     const tokens = tokensSnap.docs
-      .map((doc) => doc.data().token)
+      .map((d) => d.data().token)
       .filter(Boolean);
 
     if (!tokens.length) {
       return res.status(200).json({
         ok: true,
-        message: 'No device tokens registered',
+        message: 'No valid tokens',
         targetYmd,
+        totalSent: 0,
+        totalFailed: 0,
       });
     }
-
-    const uniqueTokens = Array.from(new Set(tokens));
 
     let totalSent = 0;
     let totalFailed = 0;
 
-    for (const docSnap of bookingsSnap.docs) {
-      const data = docSnap.data();
+    const bookingsToRemind = [];
 
-      // لو أرسلنا التذكير قبل هيك ما نعيده
-      if (data.returnReminderSent) continue;
+    bookingsSnap.forEach((doc) => {
+      const data = doc.data();
 
-      const dressCode = data.dressCode || 'غير معروف';
-      const customerName = data.customerName || 'الزبونة';
-      const startDate = data.startDate
-        ? data.startDate.toDate
-          ? data.startDate.toDate()
-          : new Date(data.startDate)
-        : targetDate;
+      // لو سبق أرسلنا تذكير لهذا الحجز نتجاهله
+      if (data.returnReminderSent) return;
 
-      const startDateStr = formatDateYmd(startDate);
+      // نحاول نحول startDate لأي شكل: Timestamp أو String
+      let startDate = null;
 
-      const title = 'تذكير بموعد تجهيز الفستان';
-      const body = `بعد يومين يبدأ حجز الفستان (${dressCode}) الخاص بـ ${customerName} بتاريخ ${startDateStr}. يرجى تجهيز الفستان للتسليم.`;
+      if (data.startDate && typeof data.startDate.toDate === 'function') {
+        startDate = data.startDate.toDate();
+      } else if (typeof data.startDate === 'string') {
+        const d = new Date(data.startDate);
+        if (!isNaN(d.getTime())) startDate = d;
+      }
 
-      const message = {
+      if (!startDate) return;
+
+      const startYmd = formatYmd(startDate);
+      if (startYmd === targetYmd) {
+        bookingsToRemind.push({ id: doc.id, data });
+      }
+    });
+
+    if (!bookingsToRemind.length) {
+      return res.status(200).json({
+        ok: true,
+        message: 'No bookings starting in 2 days',
+        targetYmd,
+        totalSent: 0,
+        totalFailed: 0,
+      });
+    }
+
+    for (const booking of bookingsToRemind) {
+      const b = booking.data;
+      const dressName = b.dressName || b.dress || 'فستان';
+      const customerName = b.customerName || 'الزبونة';
+
+      const title = `تذكير حجز لفستان "${dressName}" بعد يومين`;
+      const body = `موعد بداية حجز ${customerName} هو ${targetYmd}. يرجى تجهيز الفستان للتسليم.`;
+
+      const payload = {
         notification: { title, body },
-        tokens: uniqueTokens,
+        data: {
+          type: 'return-reminder',
+          dressName,
+          targetYmd,
+        },
       };
 
-      const response = await admin.messaging().sendEachForMulticast(message);
-      totalSent += response.successCount;
-      totalFailed += response.failureCount;
+      try {
+        const result = await adminMessaging.sendToDevice(tokens, payload);
+        result.results.forEach((r) => {
+          if (r.error) totalFailed += 1;
+          else totalSent += 1;
+        });
 
-      // نعلّم إن التذكير لهذا الحجز تم إرساله
-      await docSnap.ref.update({
-        returnReminderSent: true,
-      });
+        await adminDb.collection('bookings').doc(booking.id).update({
+          returnReminderSent: true,
+        });
+      } catch (err) {
+        console.error('Error sending reminder for booking', booking.id, err);
+        totalFailed += tokens.length;
+      }
     }
 
     return res.status(200).json({
@@ -109,8 +149,9 @@ export default async function handler(req, res) {
     });
   } catch (err) {
     console.error('checkReturnReminders error:', err);
-    return res
-      .status(500)
-      .json({ ok: false, error: err.message || 'Internal error' });
+    return res.status(500).json({
+      ok: false,
+      error: err.message || 'internal-error',
+    });
   }
 }
