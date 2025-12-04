@@ -70,7 +70,8 @@ function rangesOverlapYmd(startA, endA, startB, endB) {
  * ------------------------------------------------------------------ */
 
 function NotificationButton({ show, onClick }) {
-  if (show) return null;
+  if (!show) return null;
+  
   return (
     <button
       type="button"
