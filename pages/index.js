@@ -1065,32 +1065,76 @@ export default function HomePage() {
     }
   }
 
-  async function enableNotifications() {
-    if (typeof window === 'undefined') return;
+ const VAPID_PUBLIC_KEY =
+  process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY ||
+  'BATd4-6nGAJszdJQ5_KTBhkgF21U9J-jcHClfpSHMIf77HzCTREIT2YhxkXl1xk-wZh3OsriAC_w1I-HmBNQ0YM';
 
-    if (!('Notification' in window)) {
-      alert('هذا المتصفح لا يدعم الإشعارات.');
-      return;
-    }
+async function enableNotifications() {
+  if (typeof window === 'undefined') return;
 
-    setIsNotificationSupported(true);
-
-    if (Notification.permission === 'granted') {
-      setNotificationPermission('granted');
-      await setupNotificationsIfPossible(true);
-      return;
-    }
-
-    const permission = await Notification.requestPermission();
-    setNotificationPermission(permission);
-
-    if (permission !== 'granted') {
-      alert('لم يتم السماح بالإشعارات.');
-      return;
-    }
-
-    await setupNotificationsIfPossible(true);
+  if (!('Notification' in window)) {
+    alert('هذا المتصفح لا يدعم الإشعارات.');
+    return;
   }
+
+  try {
+    // 1) طلب الإذن
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      alert('يجب السماح بالإشعارات من إعدادات المتصفح.');
+      return;
+    }
+
+    // 2) تسجيل الـ Service Worker
+    const registration = await navigator.serviceWorker.register(
+      '/firebase-messaging-sw.js'
+    );
+
+    // 3) الحصول على messaging من Firebase
+    const messaging = await messagingPromise;
+    if (!messaging) {
+      alert('خدمة الإشعارات غير مدعومة في هذا المتصفح.');
+      return;
+    }
+
+    // 4) طلب الـ token من FCM
+    const token = await getToken(messaging, {
+      vapidKey: VAPID_PUBLIC_KEY,
+      serviceWorkerRegistration: registration,
+    });
+
+    if (!token) {
+      alert('لم يتم إرجاع توكن من FCM.');
+      return;
+    }
+
+    // 5) حفظ التوكن في Firestore
+    await addDoc(collection(db, 'deviceTokens'), {
+      token,
+      createdAt: serverTimestamp(),
+    });
+
+    // 6) نحفظه محليًا عشان ما نعيد الطلب
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('rentdress_fcm_token', token);
+    }
+
+    alert('تم تفعيل الإشعارات على هذا الجهاز بنجاح ✅');
+  } catch (err) {
+    console.error('enableNotifications error:', err);
+
+    // نعرض كود ورسالة الخطأ الحقيقية من Firebase
+    const code = err.code || 'no-code';
+    const msg = err.message || String(err);
+
+    alert(
+      'حدث خطأ أثناء الحصول على التوكن:\n' +
+        code +
+        '\n' +
+        msg
+    );
+  }
+}
 
   /* --- Firestore listeners ---------------------------------------- */
 
